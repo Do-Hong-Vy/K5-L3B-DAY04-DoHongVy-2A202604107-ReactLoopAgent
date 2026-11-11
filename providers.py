@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +13,25 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+def post_json(url, headers, payload, max_retries=6):
+    for attempt in range(max_retries):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                retry_after = exc.headers.get('Retry-After') if hasattr(exc, 'headers') else None
+                wait_time = int(retry_after) if retry_after and str(retry_after).isdigit() else (5 * (attempt + 1))
+                time.sleep(max(wait_time, 5))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -36,10 +46,20 @@ class Provider:
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
-        key_name, self.url = CONFIG[name]
-        self.key = os.getenv(key_name)
+        key_name, default_url = CONFIG[name]
+        self.key = os.getenv(key_name) or (os.getenv('API_KEY') if name == 'openai' else None)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
+
+        # Hỗ trợ custom endpoint khi dùng OpenAI compatibility (như OpenCode, vLLM, Ollama,...)
+        if name == 'openai' and (os.getenv('OPENAI_BASE_URL') or os.getenv('API_ENDPOINT')):
+            base = os.getenv('OPENAI_BASE_URL') or os.getenv('API_ENDPOINT')
+            base = base.split('?')[0].rstrip('/')
+            if not base.endswith('/chat/completions'):
+                base = base + '/chat/completions'
+            self.url = base
+        else:
+            self.url = default_url
 
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
